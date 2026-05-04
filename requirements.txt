@@ -1,0 +1,10 @@
+keyboard>=0.13.5
+mss>=10.2.0
+numpy>=2.4.4
+opencv-python>=4.13.0.92
+pillow>=12.2.0
+pydirectinput>=1.0.4
+pystray>=0.19.5
+pywin32>=311
+vgamepad>=0.1.0
+windows-capture>=2.0.0

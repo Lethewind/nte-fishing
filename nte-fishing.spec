@@ -1,10 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
-    ['main.py'],
+    ['run.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('src/marker_template.png', 'src'), ('src/click_bank_close.png', 'src')],
     hiddenimports=[
         'pywintypes',
         'win32api',
@@ -35,5 +35,6 @@ exe = EXE(
     upx=False,
     runtime_tmpdir=None,
     console=False,   # 无控制台窗口（托盘应用）
-    uac_admin=True,  # 请求管理员权限（keyboard 钩子需要）
+    uac_admin=True,  # 请求管理员权限（WH_KEYBOARD_LL 钩子 + PostMessage 需要）
+    icon='src/icon.ico',
 )
