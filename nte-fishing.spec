@@ -1,10 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
+
+asset_dir = Path('assets')
+asset_data = [(str(path), 'assets') for path in asset_dir.glob('click_bank_*.png')]
+asset_data += [
+    ('assets/marker_template.png', 'assets'),
+    ('assets/hook.png', 'assets'),
+]
+
 a = Analysis(
     ['run.py'],
     pathex=[],
     binaries=[],
-    datas=[('src/marker_template.png', 'src'), ('src/click_bank_close.png', 'src')],
+    datas=asset_data,
     hiddenimports=[
         'pywintypes',
         'win32api',
@@ -36,5 +46,5 @@ exe = EXE(
     runtime_tmpdir=None,
     console=False,   # 无控制台窗口（托盘应用）
     uac_admin=True,  # 请求管理员权限（WH_KEYBOARD_LL 钩子 + PostMessage 需要）
-    icon='src/icon.ico',
+    icon='assets/icon.ico',
 )

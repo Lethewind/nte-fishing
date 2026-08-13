@@ -1,76 +1,101 @@
 # nte-fishing
 
-《异环》（NTE）全自动钓鱼辅助工具。游戏可完全在后台运行，工具自动完成抛竿→等待上钩→钓鱼小游戏→关闭结算界面的完整循环，不影响电脑的正常使用。
+[繁體中文](README.zh-TW.md)
 
-## 功能
+A Windows fishing helper for 异环/異環 and NTE. It locates the game window
+dynamically, captures it in the background, and drives the fishing loop through
+a small state machine.
 
-- 完全后台运行，无需游戏窗口置于前台
-- 自动检测游戏状态（空闲 / 上钩 / 钓鱼小游戏）
-- 钓鱼小游戏中实时控制玩家竖线跟随鱼的滑块
-- 自动按 ESC 关闭结算界面并开始下一轮
-- 系统托盘图标 + F12 热键开关
+## Run
 
-## 下载
+Python 3.11 or newer is required.
 
-前往 [Releases](https://github.com/Lethewind/nte-fishing/releases) 页面下载最新版 `nte-fishing.exe`，双击运行即可（会弹出 UAC 管理员权限请求，需要允许）。
-
-## 使用方法
-
-1. 以**管理员权限**运行 `nte-fishing.exe`
-2. 系统托盘出现图标，启动游戏并进入可钓鱼的场景
-3. 按 **F12** 启动自动钓鱼（再按一次暂停）
-4. 退出：右键托盘图标 → 退出
-
-启动后游戏窗口无需保持前台，可以正常使用电脑的其他功能。
-
-## 工作原理
-
-```
-IDLE → 按 F 抛竿 → 等待上钩
-  ↓ 检测到蓝色上钩光晕
-按 F 确认 → 进入钓鱼小游戏
-  ↓ 实时控制 A/D，将玩家竖线保持在鱼的绿色滑块内
-钓鱼结束 → 等待结算界面 → 按 ESC 关闭 → 回到 IDLE
-```
-
-**截图**：mss 截取游戏窗口的屏幕坐标区域，无需游戏在前台
-
-**状态检测**：OpenCV HSV 颜色过滤
-- 鱼滑块：绿色（H 75–90）
-- 玩家竖线：黄色（H 22–40，V > 235）
-- 上钩信号：蓝色光晕（H 100–130，像素数 > 500）
-
-**按键注入**：
-- F / ESC：PostMessage 后台发送，完全不影响其他窗口
-- A / D：SendInput 驱动级注入 + WH_KEYBOARD_LL 钩子屏蔽消息队列
-
-  > A/D 注入原理：SendInput 先更新全局 `GetAsyncKeyState` 状态（游戏读这里），随后低级键盘钩子将 WM_KEYDOWN 从消息队列中吞掉。结果是游戏收到按键，其他任何窗口都收不到。
-
-## 配置
-
-所有参数在 `config.py` 中，常用项：
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `GAME_WINDOW_TITLE` | `"异环"` | 游戏窗口标题 |
-| `TOGGLE_HOTKEY` | `"f12"` | 开关热键 |
-| `DEAD_ZONE` | `10` | 控制死区（像素） |
-| `END_WAIT_SEC` | `5.0` | 钓鱼结束后等待结算界面出现的时间（秒） |
-| `MAX_WAIT_SEC` | `60.0` | 等待上钩超时后重新抛竿（秒） |
-
-## 从源码运行
-
-需要 Python 3.11+ 和 [uv](https://github.com/astral-sh/uv)：
-
-```bash
-git clone https://github.com/Lethewind/nte-fishing.git
-cd nte-fishing
+```powershell
 uv sync
-uv run main.py
+uv run run.py
 ```
 
-## 注意事项
+`run.py` is the production entry point. Use the tray menu or F12 to start and
+stop the runtime. Closing the OpenCV preview only disables the preview; it does
+not stop fishing.
 
-- 需要管理员权限（键盘钩子注册需要）
-- 游戏窗口不应被其他窗口完全遮挡（mss 截取的是屏幕像素）
-- HSV 颜色阈值针对默认画质校准，若画质设置不同可在 `config.py` 中调整
+## How it works
+
+The core loop captures one full client frame and lets the state machine request
+lazy vision probes in this order:
+
+```text
+bar
+├─ found   → fish-area segments → marker → LEFT / RIGHT / RELEASE
+└─ missing or incomplete → result → hook
+                            │        └─ tap F on schedule
+                            └─ tap ESC, throttled to once per 3 seconds
+```
+
+Only three runtime states are used: `NO_WINDOW`, `SEARCHING`, and `FISHING`.
+Fishing runs at the high refresh interval; all other states use the normal loop
+interval.
+
+## Configuration
+
+Copy `.env.example` to `.env`. The local `.env` is ignored by Git.
+
+Input transport and direction assignment are independent:
+
+```env
+INPUT_FUNCTION=sendmessage   # sendmessage, postmessage, foreground
+INPUT_ASSIGNMENT=ad          # ad, arrows
+SEND_ACTIVATION_HINTS=false  # experimental WM_ACTIVATE/WM_SETFOCUS hints
+```
+
+`sendmessage` and `postmessage` can target a background HWND, but a game may
+still ignore input while it is not foreground. `foreground` uses SendInput after
+activating the game window.
+
+### Languages and result templates
+
+Window titles are mapped by language. The result template path is derived from
+the language key:
+
+```text
+<lang> → WINDOW_TITLES_<LANG> → assets/click_bank_<lang>.png
+```
+
+Current defaults:
+
+```env
+LANGUAGES=zh,zhtw
+WINDOW_TITLES_ZH=异环,異環
+WINDOW_TITLES_ZHTW=NTE
+```
+
+To add Japanese support, for example:
+
+1. Add `jp` to `LANGUAGES`.
+2. Set `WINDOW_TITLES_JP` to comma-separated title aliases.
+3. Add `assets/click_bank_jp.png`.
+
+The same convention supports `click_bank_en.png` or any other language key
+without changing Python code. Language order also determines priority when
+aliases overlap; exact title matches are always preferred over partial matches.
+
+## Project layout
+
+```text
+assets/                 templates and application icon
+src/state_machine.py    probe order, states, timers, and actions
+src/detector.py         single-frame lazy CV probes
+src/runtime.py          capture/decision/input loop and debug rendering
+src/padinput.py         input backend and A/D or arrow assignment
+src/capture.py          HWND discovery integration and frame capture
+run.py                  production entry point
+```
+
+## Tests and packaging
+
+```powershell
+uv run pytest
+uv run pyinstaller nte-fishing.spec
+```
+
+The PyInstaller spec bundles the templates from `assets/`.

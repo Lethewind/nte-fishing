@@ -1,200 +1,190 @@
+"""Window discovery and background-capable frame capture."""
+
+from __future__ import annotations
+
 import ctypes
 import ctypes.wintypes
 import logging
 import threading
+
 import cv2
+import mss
 import numpy as np
 import win32gui
 import win32ui
-import mss
-from windows_capture import WindowsCapture as _WGCapture, Frame, InternalCaptureControl
+from windows_capture import Frame, InternalCaptureControl, WindowsCapture as _WGCapture
+
+from src import padinput
+from src.settings import GameProfile, settings
+from src.window_locator import WindowLocator, WindowMatch
 
 log = logging.getLogger(__name__)
 
-_WDA_EXCLUDEFROMCAPTURE = 0x00000011
-_PW_RENDERFULLCONTENT   = 0x00000002
+_PW_RENDERFULLCONTENT = 0x00000002
 
 
 class WindowCapture:
-    """
-    截图优先级：
-    1. WGC（Windows Graphics Capture）：后台 DX 内容，但被 WDA_EXCLUDEFROMCAPTURE 屏蔽时返回黑帧
-    2. PrintWindow(PW_RENDERFULLCONTENT)：不受 WDA_EXCLUDEFROMCAPTURE 限制，无需窗口可见
-    3. mss：仅当窗口在屏幕上可见时有效，作为最终兜底
-    """
-
-    def __init__(self, window_title: str):
-        self.window_title = window_title
-        self.hwnd = self._find_hwnd()
+    def __init__(
+        self,
+        locator: WindowLocator | None = None,
+    ):
+        self.locator = locator or WindowLocator()
+        self.match: WindowMatch | None = None
+        self.hwnd = 0
+        self.profile: GameProfile | None = None
         self._lock = threading.Lock()
         self._latest_frame: np.ndarray | None = None
-        self._sct = mss.mss()
-        self._start_wgc()
+        self._sct = mss.MSS()
+        self.refresh_hwnd()
 
-    # ------------------------------------------------------------------
-    # 公开接口
-    # ------------------------------------------------------------------
+    @property
+    def active_profile(self) -> GameProfile | None:
+        return self.profile
 
     def is_window_found(self) -> bool:
-        return self.hwnd != 0
+        return self.match is not None and self.locator.is_valid(self.match)
 
-    def refresh_hwnd(self):
-        self.hwnd = self._find_hwnd()
-
-    def get_window_size(self) -> tuple[int, int]:
-        if not self.is_window_found():
-            return (0, 0)
-        rect = win32gui.GetClientRect(self.hwnd)
-        return (rect[2], rect[3])
-
-    def get_frame(self, region: tuple[float, float, float, float] | None = None) -> np.ndarray | None:
-        if not self.is_window_found():
-            self.refresh_hwnd()
-            if not self.is_window_found():
-                return None
+    def refresh_hwnd(self) -> WindowMatch | None:
+        match = self.locator.find()
+        if match is None:
+            self._clear_target()
+            return None
+        changed = match.hwnd != self.hwnd
+        if changed:
+            padinput.PAD_INPUT.reset()
+        self.match = match
+        self.hwnd = match.hwnd
+        self.profile = match.profile
+        padinput.HWND = self.hwnd
+        if changed:
+            with self._lock:
+                self._latest_frame = None
             self._start_wgc()
+        return match
 
+    def _clear_target(self) -> None:
+        padinput.PAD_INPUT.reset()
+        self.match = None
+        self.profile = None
+        self.hwnd = 0
+        padinput.HWND = 0
         with self._lock:
-            frame = self._latest_frame
+            self._latest_frame = None
 
-        # WGC 黑帧（WDA_EXCLUDEFROMCAPTURE 保护）→ 降级为 PrintWindow
-        if frame is not None and frame.mean() < 5:
-            log.debug("WGC 返回黑帧（均值=%.2f），疑似 WDA 保护，尝试 PrintWindow", frame.mean())
-            frame = None
+    def _ensure_target(self) -> bool:
+        if self.is_window_found():
+            return True
+        return self.refresh_hwnd() is not None
 
-        if frame is None:
-            frame = self._print_window_capture()
-
-        if frame is None:
-            log.debug("PrintWindow 无效，降级为 mss")
-            frame = self._mss_capture()
-
-        if frame is None:
+    def get_frame(
+        self, region: tuple[float, float, float, float] | None = None
+    ) -> np.ndarray | None:
+        if not self._ensure_target():
             return None
 
-        if region is None:
+        with self._lock:
+            full_frame = self._latest_frame
+        frame = full_frame
+        if frame is not None and frame.mean() < 5:
+            frame = None
+        if frame is None:
+            frame = self._print_window_capture()
+        if frame is None:
+            frame = self._mss_capture()
+        if frame is None:
             return frame
+        return self.crop_frame(frame, region)
 
-        h, w = frame.shape[:2]
-        x1 = int(region[0] * w)
-        y1 = int(region[1] * h)
-        x2 = int(region[2] * w)
-        y2 = int(region[3] * h)
+    @staticmethod
+    def crop_frame(
+        frame: np.ndarray | None,
+        region: tuple[float, float, float, float] | None,
+    ) -> np.ndarray | None:
+        if frame is None or region is None:
+            return frame
+        height, width = frame.shape[:2]
+        x1, y1 = int(region[0] * width), int(region[1] * height)
+        x2, y2 = int(region[2] * width), int(region[3] * height)
         return frame[y1:y2, x1:x2]
 
-    # ------------------------------------------------------------------
-    # WGC
-    # ------------------------------------------------------------------
-
-    def _start_wgc(self):
-        if not self.is_window_found():
+    def _start_wgc(self) -> None:
+        target_hwnd = self.hwnd
+        if not target_hwnd:
             return
-
-        # 记录 WDA 保护状态，方便诊断
-        aff = ctypes.c_uint32(0)
-        ctypes.windll.user32.GetWindowDisplayAffinity(self.hwnd, ctypes.byref(aff))
-        if aff.value != 0:
-            log.warning("窗口 WDA 保护已开启（值=%d），WGC 在后台可能返回黑帧，将自动降级为 PrintWindow", aff.value)
-        else:
-            log.info("窗口 WDA 保护未开启，WGC 后台截图应正常")
-
         try:
-            cap = _WGCapture(
+            capture = _WGCapture(
                 cursor_capture=False,
                 draw_border=False,
-                window_hwnd=self.hwnd,
+                window_hwnd=target_hwnd,
             )
 
-            _first_frame = [True]
-
-            @cap.event
-            def on_frame_arrived(frame: Frame, ctrl: InternalCaptureControl):
+            @capture.event
+            def on_frame_arrived(frame: Frame, _control: InternalCaptureControl):
+                if self.hwnd != target_hwnd:
+                    return
                 try:
                     bgr = frame.frame_buffer[:, :, :3].copy()
-                    cr = win32gui.GetClientRect(self.hwnd)
-                    lw, lh = cr[2], cr[3]
-                    if lw > 0 and lh > 0 and (bgr.shape[1] != lw or bgr.shape[0] != lh):
-                        bgr = cv2.resize(bgr, (lw, lh), interpolation=cv2.INTER_LINEAR)
+                    rect = win32gui.GetClientRect(target_hwnd)
+                    width, height = rect[2], rect[3]
+                    if width > 0 and height > 0 and (bgr.shape[1] != width or bgr.shape[0] != height):
+                        bgr = cv2.resize(bgr, (width, height), interpolation=cv2.INTER_LINEAR)
                     with self._lock:
                         self._latest_frame = bgr
-                    if _first_frame[0]:
-                        _first_frame[0] = False
-                        log.info("WGC 首帧到达 %dx%d 均值=%.1f（hwnd=%d）",
-                                 bgr.shape[1], bgr.shape[0], bgr.mean(), self.hwnd)
-                except Exception as e:
-                    log.warning("WGC 帧处理失败: %s", e)
+                except Exception as exc:
+                    log.debug("WGC frame error: %s", exc)
 
-            @cap.event
+            @capture.event
             def on_closed():
-                log.warning("WGC 会话关闭（hwnd=%d）", self.hwnd)
-                with self._lock:
-                    self._latest_frame = None
+                if self.hwnd == target_hwnd:
+                    with self._lock:
+                        self._latest_frame = None
 
-            def _run():
+            def run_capture() -> None:
                 try:
-                    cap.start()
-                except Exception as e:
-                    log.warning("WGC cap.start() 异常退出: %s", e)
+                    capture.start()
+                except Exception as exc:
+                    log.debug("WGC start failed: %s", exc)
 
-            threading.Thread(target=_run, daemon=True, name="wgc-capture").start()
-            log.info("WGC 截图已启动（hwnd=%d）", self.hwnd)
-        except Exception as e:
-            log.warning("WGC 初始化失败: %s", e)
-
-    # ------------------------------------------------------------------
-    # PrintWindow（不受 WDA_EXCLUDEFROMCAPTURE 限制）
-    # ------------------------------------------------------------------
+            threading.Thread(target=run_capture, daemon=True, name="wgc-capture").start()
+        except Exception as exc:
+            log.debug("WGC unavailable: %s", exc)
 
     def _print_window_capture(self) -> np.ndarray | None:
         try:
-            cr = win32gui.GetClientRect(self.hwnd)
-            cw, ch = cr[2], cr[3]
-            if cw == 0 or ch == 0:
+            rect = win32gui.GetClientRect(self.hwnd)
+            width, height = rect[2], rect[3]
+            if width <= 0 or height <= 0:
                 return None
-            hDC    = win32gui.GetDC(self.hwnd)
-            mfcDC  = win32ui.CreateDCFromHandle(hDC)
-            memDC  = mfcDC.CreateCompatibleDC()
-            bmp    = win32ui.CreateBitmap()
-            bmp.CreateCompatibleBitmap(mfcDC, cw, ch)
-            memDC.SelectObject(bmp)
-            ctypes.windll.user32.PrintWindow(self.hwnd, memDC.GetSafeHdc(), _PW_RENDERFULLCONTENT)
-            raw  = bmp.GetBitmapBits(True)
-            bgr  = np.frombuffer(raw, dtype=np.uint8).reshape((ch, cw, 4))[:, :, :3].copy()
-            win32gui.DeleteObject(bmp.GetHandle())
-            memDC.DeleteDC()
-            mfcDC.DeleteDC()
-            win32gui.ReleaseDC(self.hwnd, hDC)
-            if bgr.mean() < 5:
-                return None
-            return bgr
-        except Exception as e:
-            log.debug("PrintWindow 失败: %s", e)
+            window_dc = win32gui.GetDC(self.hwnd)
+            source_dc = win32ui.CreateDCFromHandle(window_dc)
+            memory_dc = source_dc.CreateCompatibleDC()
+            bitmap = win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(source_dc, width, height)
+            memory_dc.SelectObject(bitmap)
+            ctypes.windll.user32.PrintWindow(
+                self.hwnd, memory_dc.GetSafeHdc(), _PW_RENDERFULLCONTENT
+            )
+            raw = bitmap.GetBitmapBits(True)
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 4))[:, :, :3].copy()
+            win32gui.DeleteObject(bitmap.GetHandle())
+            memory_dc.DeleteDC()
+            source_dc.DeleteDC()
+            win32gui.ReleaseDC(self.hwnd, window_dc)
+            return None if frame.mean() < 5 else frame
+        except Exception as exc:
+            log.debug("PrintWindow capture failed: %s", exc)
             return None
-
-    # ------------------------------------------------------------------
-    # mss 兜底
-    # ------------------------------------------------------------------
 
     def _mss_capture(self) -> np.ndarray | None:
         try:
-            cr = win32gui.GetClientRect(self.hwnd)
-            cw, ch = cr[2], cr[3]
-            if cw == 0 or ch == 0:
+            rect = win32gui.GetClientRect(self.hwnd)
+            width, height = rect[2], rect[3]
+            if width <= 0 or height <= 0:
                 return None
-            pt = ctypes.wintypes.POINT(0, 0)
-            ctypes.windll.user32.ClientToScreen(self.hwnd, ctypes.byref(pt))
-            monitor = {"left": pt.x, "top": pt.y, "width": cw, "height": ch}
-            sct_img = self._sct.grab(monitor)
-            return np.array(sct_img)[:, :, :3]
-        except Exception:
+            point = ctypes.wintypes.POINT(0, 0)
+            ctypes.windll.user32.ClientToScreen(self.hwnd, ctypes.byref(point))
+            monitor = {"left": point.x, "top": point.y, "width": width, "height": height}
+            return np.array(self._sct.grab(monitor))[:, :, :3]
+        except Exception as exc:
+            log.debug("mss capture failed: %s", exc)
             return None
-
-    # ------------------------------------------------------------------
-
-    def _find_hwnd(self) -> int:
-        result = [0]
-        def cb(hwnd, _):
-            if win32gui.IsWindowVisible(hwnd) and self.window_title in win32gui.GetWindowText(hwnd):
-                result[0] = hwnd
-        win32gui.EnumWindows(cb, None)
-        return result[0]

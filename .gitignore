@@ -4,30 +4,29 @@ __pycache__/
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 
 # Virtual environments
-.venv
+.venv/
+venv/
+Include/
+Lib/
+Scripts/
+pyvenv.cfg
 
 # PyInstaller output
-dist/
-build/
 *.spec.bak
 
-# Project specific
+# Local settings and captured media
+.env
 frames/
 debug_frame_*.png
 frames_*/
 *.mp4
 *.avi
 *.mov
+pic/
 
-# Claude internal
+# Tooling metadata
 .claude/
 docs/superpowers/
-
-# Analysis scripts
-analyze_hook.py
-
-# Debug screenshots
-pic/
