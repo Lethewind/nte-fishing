@@ -1,0 +1,8 @@
+mss>=10.2.0
+numpy>=2.4.4
+opencv-python>=4.13.0.92
+pillow>=12.2.0
+python-dotenv>=1.0.1
+pystray>=0.19.5
+pywin32>=311
+windows-capture>=2.0.0
